@@ -55,6 +55,12 @@ class TvafDb(object):
             "create index if not exists "
             "item_on_key_and_value on item (key_id, value)")
 
+    def drop_indexes(self):
+        assert not self.auto_ensure_indexes
+        self.db.execute("drop index if exists item_on_updated_at")
+        self.db.execute("drop index if exists item_on_key_and_updated_at")
+        self.db.execute("drop index if exists item_on_key_and_value")
+
     @property
     def db(self):
         if hasattr(self._local, "db"):
