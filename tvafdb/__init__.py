@@ -1,6 +1,7 @@
 import json
-import sqlite3
 import threading
+
+import apsw
 
 
 class CrudResult(object):
@@ -45,28 +46,32 @@ class TvafDb(object):
         self.auto_ensure_indexes = auto_ensure_indexes
 
     def ensure_indexes(self):
-        self.db.execute(
+        c = self.db.cursor()
+        c.execute(
             "create index if not exists "
             "item_on_updated_at on item (updated_at)")
-        self.db.execute(
+        c.execute(
             "create index if not exists "
             "item_on_key_and_updated_at on item (key_id, updated_at)")
-        self.db.execute(
+        c.execute(
             "create index if not exists "
             "item_on_key_and_value on item (key_id, value)")
 
     def drop_indexes(self):
         assert not self.auto_ensure_indexes
-        self.db.execute("drop index if exists item_on_updated_at")
-        self.db.execute("drop index if exists item_on_key_and_updated_at")
-        self.db.execute("drop index if exists item_on_key_and_value")
+        c = self.db.cursor()
+        c.execute("drop index if exists item_on_updated_at")
+        c.execute("drop index if exists item_on_key_and_updated_at")
+        c.execute("drop index if exists item_on_key_and_value")
 
     @property
     def db(self):
         if hasattr(self._local, "db"):
             return self._local.db
-        db = sqlite3.connect(self.path)
-        db.execute(
+        db = apsw.Connection(self.path)
+        db.setbusytimeout(5000)
+        c = db.cursor()
+        c.execute(
             "create table if not exists item ("
             "path_id integer not null, "
             "key_id integer not null, "
@@ -74,21 +79,21 @@ class TvafDb(object):
             "updated_at integer not null, "
             "deleted tinyint not null default 0, "
             "primary key (path_id, key_id))")
-        db.execute(
+        c.execute(
             "create table if not exists global ("
             "name text not null primary key, "
             "value blob)")
-        db.execute(
+        c.execute(
             "create table if not exists "
             "key (id integer primary key, name text not null)")
-        db.execute(
+        c.execute(
             "create unique index if not exists key_on_name on key (name)")
-        db.execute(
+        c.execute(
             "create table if not exists "
             "path (id integer primary key, name text not null)")
-        db.execute(
-            "create unique index if not exists path_on_name on key (path)")
-        db.execute("pragma journal_mode=wal")
+        c.execute(
+            "create unique index if not exists path_on_name on path (name)")
+        c.execute("pragma journal_mode=wal")
         self._local.db = db
         if self.auto_ensure_indexes:
             self.ensure_indexes()
@@ -98,7 +103,7 @@ class TvafDb(object):
         prev = None
         if path == "/":
             path = ""
-        c = self.db.execute(
+        c = self.db.cursor().execute(
             "select path.name from path "
             "inner join item on path.id = item.path_id "
             "where path.name > ? and path.name < ? and not item.deleted "
@@ -122,7 +127,7 @@ class TvafDb(object):
             args["key"] = keys
         else:
             pred = "1"
-        c = self.db.execute(
+        c = self.db.cursor().execute(
             "select key.name, item.value from path "
             "inner join item on path.id = item.path_id "
             "inner join key on key.id = item.key_id "
@@ -161,7 +166,7 @@ class TvafDb(object):
         query += " inner join path on i0.path_id = path.id"
         if where_clauses:
             query += " where " + " and ".join(where_clauses)
-        c = self.db.execute(query, args)
+        c = self.db.cursor().execute(query, args)
         for path, in c:
             yield path
 
@@ -179,7 +184,7 @@ class TvafDb(object):
         else:
             key_predicate = "1"
 
-        c = self.db.execute(
+        c = self.db.cursor().execute(
             "select "
             "path.name, key.name, item.updated_at, item.deleted "
             "from item "
@@ -212,92 +217,97 @@ class TvafDb(object):
                 cur, max_updated_at, keys)
 
     def update(self, path, data, timestamp=None):
-        self.updatemany([(path, data)], timestamp=timestamp)
+        with self.db:
+            self.updatemany([(path, data)], timestamp=timestamp)
 
     def updatemany(self, pairs, timestamp=None):
-        if timestamp is None:
-            timestamp = self.tick()
-        paths = list(set(path for path, data in pairs))
-        keys = list(set(
-            k for path, data in pairs for k, v in data.iteritems()))
+        with self.db:
+            if timestamp is None:
+                timestamp = self.tick()
+            paths = list(set(path for path, data in pairs))
+            keys = list(set(
+                k for path, data in pairs for k, v in data.iteritems()))
 
-        path_to_id = {}
-        key_to_id = {}
+            path_to_id = {}
+            key_to_id = {}
 
-        if paths:
-            self.db.executemany(
-                "insert or ignore into path (name) values (?)",
-                [(path,) for path in paths])
-        for i in range(0, len(paths), self.MAX_PARAMS):
-            part = paths[i:i + self.MAX_PARAMS]
-            path_to_id.update({
-                p: i for i, p in self.db.execute(
-                    "select id, name from path where name in (%s)" %
-                    ",".join("?" for _ in range(len(part))), part)})
-        assert len(paths) == len(path_to_id)
+            if paths:
+                self.db.cursor().executemany(
+                    "insert or ignore into path (name) values (?)",
+                    [(path,) for path in paths])
+            for i in range(0, len(paths), self.MAX_PARAMS):
+                part = paths[i:i + self.MAX_PARAMS]
+                path_to_id.update({
+                    p: i for i, p in self.db.cursor().execute(
+                        "select id, name from path where name in (%s)" %
+                        ",".join("?" for _ in range(len(part))), part)})
+            assert len(paths) == len(path_to_id)
 
-        if keys:
-            self.db.executemany(
-                "insert or ignore into key (name) values (?)",
-                [(key,) for key in keys])
-        for i in range(0, len(keys), self.MAX_PARAMS):
-            part = keys[i:i + self.MAX_PARAMS]
-            key_to_id.update({
-                k: i for i, k in self.db.execute(
-                    "select id, name from key where name in (%s)" %
-                    ",".join("?" for _ in range(len(part))), part)})
-        assert len(keys) == len(key_to_id)
+            if keys:
+                self.db.cursor().executemany(
+                    "insert or ignore into key (name) values (?)",
+                    [(key,) for key in keys])
+            for i in range(0, len(keys), self.MAX_PARAMS):
+                part = keys[i:i + self.MAX_PARAMS]
+                key_to_id.update({
+                    k: i for i, k in self.db.cursor().execute(
+                        "select id, name from key where name in (%s)" %
+                        ",".join("?" for _ in range(len(part))), part)})
+            assert len(keys) == len(key_to_id)
 
-        arglist = []
-        for path, data in pairs:
-            for k, v in data.iteritems():
-                arglist.append(
-                    {"path_id": path_to_id[path], "timestamp": timestamp,
-                     "key_id": key_to_id[k], "value": encode(v)})
+            arglist = []
+            for path, data in pairs:
+                for k, v in data.iteritems():
+                    arglist.append(
+                        {"path_id": path_to_id[path], "timestamp": timestamp,
+                         "key_id": key_to_id[k], "value": encode(v)})
 
-        self.db.executemany(
-            "insert or ignore into item "
-            "(path_id, key_id, value, updated_at) values "
-            "(:path_id, :key_id, :value, :timestamp)", arglist)
-        self.db.executemany(
-            "update item set deleted = 0, value = :value, "
-            "updated_at = :timestamp "
-            "where path_id = :path_id and key_id = :key_id "
-            "and (deleted or value is not :value)", arglist)
+            self.db.cursor().executemany(
+                "insert or ignore into item "
+                "(path_id, key_id, value, updated_at) values "
+                "(:path_id, :key_id, :value, :timestamp)", arglist)
+            self.db.cursor().executemany(
+                "update item set deleted = 0, value = :value, "
+                "updated_at = :timestamp "
+                "where path_id = :path_id and key_id = :key_id "
+                "and (deleted or value is not :value)", arglist)
 
     def delete(self, path, keys=None, timestamp=None):
-        if timestamp is None:
-            timestamp = self.tick()
-        args = {"path": path, "timestamp": timestamp}
-        if keys is None:
-            condition = "1"
-        else:
-            condition = (
-                "key_id in (select id from key where name in (%s))" %
-                ",".join(":k%d" % i for i in range(len(keys))))
-            for i, k in enumerate(keys):
-                args["k%d" % i] = k
-        self.db.execute(
-            "update item set deleted = 1, updated_at = :timestamp "
-            "where path_id = (select id from path where name = :path) "
-            "and not deleted and %(condition)s" % {"condition": condition},
-            args)
+        with self.db:
+            if timestamp is None:
+                timestamp = self.tick()
+            args = {"path": path, "timestamp": timestamp}
+            if keys is None:
+                condition = "1"
+            else:
+                condition = (
+                    "key_id in (select id from key where name in (%s))" %
+                    ",".join(":k%d" % i for i in range(len(keys))))
+                for i, k in enumerate(keys):
+                    args["k%d" % i] = k
+            self.db.cursor().execute(
+                "update item set deleted = 1, updated_at = :timestamp "
+                "where path_id = (select id from path where name = :path) "
+                "and not deleted and %(condition)s" % {"condition": condition},
+                args)
 
     def get_global(self, name):
-        row = self.db.execute(
+        row = self.db.cursor().execute(
             "select value from global where name = ?", (name,)).fetchone()
         if row:
             return row[0]
 
     def set_global(self, name, value):
-        self.db.execute(
-            "insert or replace into global (name, value) values (?, ?)",
-            (name, value))
+        with self.db:
+            self.db.cursor().execute(
+                "insert or replace into global (name, value) values (?, ?)",
+                (name, value))
 
     def tick(self):
-        timestamp = self.get_timestamp() + 1
-        self.set_global("timestamp", timestamp)
-        return timestamp
+        with self.db:
+            timestamp = self.get_timestamp() + 1
+            self.set_global("timestamp", timestamp)
+            return timestamp
 
     def get_timestamp(self):
         return self.get_global("timestamp") or 0
